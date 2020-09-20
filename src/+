@@ -61,7 +61,7 @@ impl Mem {
             perms:  vec![Perm(PERM_NONE); size],
 
             dirty_blocks_list: Vec::with_capacity( size / DIRTY_BLOCK_SZ + 1),
-            dirty_blocks_bmp:   vec![0; size / DIRTY_BLOCK_SZ  / 8 + 1],
+            dirty_blocks_bmp:   vec![0; size / DIRTY_BLOCK_SZ / 8 + 1 ],
         }
     }
 
@@ -79,44 +79,51 @@ impl Mem {
     }
 
     pub fn reset(&mut self, prev: &Mem) -> () {
-        // Restore the dirtied blockes of `mem` and `perms`.
-        for block in &self.dirty_blocks_list {
-            let block = *block;
-            //println!("[DBG] ---- {:#x}", block);
-            
-            let a = block * DIRTY_BLOCK_SZ;
-            let b = a + DIRTY_BLOCK_SZ;
-            //println!("[DBG] !!!! {:#x} .. {:#x}", a, a + DIRTY_BLOCK_SZ);
-            
-            &self.mem[a .. b].copy_from_slice(&prev.mem[a .. b]);
-            &self.perms[a .. b].copy_from_slice(&prev.perms[a .. b]);
+        // Restore the dirtied blockes of `mem` and perms.
+        for dbva in &self.dirty_blocks_list {
+            let dbva = *dbva;
+            println!("[{:#x}, {:#x?})", dbva, dbva+DIRTY_BLOCK_SZ);
+            let b = dbva/DIRTY_BLOCK_SZ;
+            self.mem.copy_from_slice(&prev.mem[b .. b + DIRTY_BLOCK_SZ]);
+            self.perms.copy_from_slice(&prev.perms[b .. b + DIRTY_BLOCK_SZ]);
         }
 
         self.clear_dirty_all();
     }
 
+    /// Set as dirty the block that contains addr.
+    /// It can panic if inputs are out of bounds. Make sure
+    /// to call it only when you know it is safe. It is used
+    /// internally to maintain dirty state when writes happen.
+    #[inline]
+    fn set_dirty_addr(&mut self, addr: VirtAddr) -> () {
+         let addr = addr.0;
+         let off = (addr / DIRTY_BLOCK_SZ) / 8;
+         let idx = (addr % DIRTY_BLOCK_SZ) % 8;
+         
+         println!("set_dirty_addr(addr: {:#x}) off = {:#x} idx = {:#x}", 
+                  addr, off, idx);
+
+         // If the block to which `addr` corresponds is not dirty...
+         if (self.dirty_blocks_bmp[off] & (1 << idx)) == 0 {
+            // Mark the block as dirty.
+            self.dirty_blocks_bmp[off] |= 1 << idx;
+            // Add the base address of the block into the list of dirty blocks.
+            self.dirty_blocks_list.push(addr / DIRTY_BLOCK_SZ);
+         }
+    }
+
     /// Set as dirty the memory in the range [addr, addr+size).
     /// It can panic if out of bounds so make sure it is called 
     /// after bound checking is already performed.
-    #[inline]
     fn set_dirty(&mut self, addr: VirtAddr, size: usize) -> () {
-        let addr = addr.0;
-       
-        let start = addr / DIRTY_BLOCK_SZ;
-        let end   = (addr + size) / DIRTY_BLOCK_SZ;
-        
-        for block in start ..= end { // XXX 
-            let off = block / 8;
-            let idx = block % 8;
-            
-            if (self.dirty_blocks_bmp[off] & (1 << idx)) == 0 {
-                // Mark the block as dirty.
-                self.dirty_blocks_bmp[off] |= 1 << idx;
-                // Add the base address of the block into the list of dirty blocks.
-                self.dirty_blocks_list.push(block);
-            }
+       // println!("[DEBUG] set_dirty(addr: {:?}, size: {})", addr, size);
+        for ii in (addr.0 / DIRTY_BLOCK_SZ .. addr.0 + size)
+        .step_by(DIRTY_BLOCK_SZ) {
+            self.set_dirty_addr(VirtAddr(ii*DIRTY_BLOCK_SZ));
         }
     }
+    
     /// Make all memory non-dirty.
     #[inline]
     fn clear_dirty_all(&mut self) -> () {

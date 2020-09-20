@@ -52,6 +52,7 @@ pub fn main() {
     m2.mem.write_ignore_perms(VirtAddr(0x4005d0), &buf[..]); // overwrite first instruction.
     m2.reset(&m);
     m2.run_interpreted();
-    
+
+
 }
 
