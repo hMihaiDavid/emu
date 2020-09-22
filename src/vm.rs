@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::vm_mem::{Mem, VirtAddr, Perm, PERM_READ, PERM_WRITE, PERM_EXEC,
-                    PERM_RAW };
+                    PERM_RAW};
 
 //// General purpose register indeces used to index `Vm::gprs`.
 #[repr(usize)]
@@ -75,6 +75,7 @@ impl From<u32> for RFormat {
 #[derive(Debug)]
 struct IFormat {
     offset: u16, // remember to do as i16 as whatever to sign extend.
+    rt: usize,
     rs: usize,
 }
 
@@ -82,6 +83,7 @@ impl From<u32> for IFormat {
     fn from(inst: u32) -> Self {
         IFormat {
             offset: (  inst & 0xffff) as u16,
+            rt:     ( (inst >> 16) & 0x1f) as usize,
             rs:     ( (inst >> 21) & 0x1f) as usize,
         }
     }
@@ -114,6 +116,10 @@ pub enum VmExit {
     IntegerOverflow(VirtAddr),
     /// An invalid instruction at `VirtAddr` attempted execution. 
     IllegalInstruction(VirtAddr),
+
+    /// Collision between data segment and stack segment. This happens
+    /// because of brk() or when growing stack.
+    SegmentOverflow,
 }
 
 // A linux SysV abi MIPS II LE emulated guest.
@@ -194,30 +200,17 @@ impl Vm {
     /// This function emulates the guest in a slow fetch-decode-execute
     /// loop instruction by instruction, it doesn't use a JIT.
     pub fn run_interpreted(&mut self) -> Result<(), VmExit> {
-        let mut slot_pc: Option<u32> = None;
-        
+        let mut jmp_target: Option<u32> = None;
+
         'next_instr: loop {
             let pc: u32    = self.pc();
             
-            // If the previous iteration was a taken branch, we will
-            // not execute the instruction at pc (target address) but the
-            // one in the delay slot, which we will set appropiately.
-            // We also clear the slot so that next cycle we continue
-            // at the effective target.
-            let instr_addr = match slot_pc {
-                Some(val) => {
-                    slot_pc = None;
-                    val
-                },
-                None => pc,
-            };
-
             let instr: u32 = self.mem.read_u32_le_exec(
-                                        VirtAddr(instr_addr as usize))?;
+                                        VirtAddr(pc as usize))?;
+            let instr_val = instr;
             
-            println!("Executing {:#0x} @ addr {:#0x} (slot: {:#0x?})",
-                     instr, instr_addr, slot_pc);
-            
+            println!("Executing instruction {:x} @ pc {:#x}", instr_val, pc);
+
             match (instr >> 26) as u8 { // higher 6 bits or op.
                 0b00_000000 => { // R-format (higher 6 bits (op) to zero)
                     let instr = RFormat::from(instr);
@@ -225,6 +218,7 @@ impl Vm {
                     match (instr.funct) as u8 {
                         0b00_000000 => {
                             // SLL
+                            //panic!("la vie en rose");
                             if instr.rs != 0 {
                                 return Err(VmExit::IllegalInstruction(
                                             VirtAddr(pc as usize)));
@@ -294,38 +288,106 @@ impl Vm {
 
                 
                 },
+
+                0b00_001111 => {
+                    // LUI
+                    let instr = IFormat::from(instr);
+                    if instr.rs != 0 {
+                        return Err(VmExit::IllegalInstruction(
+                                VirtAddr(pc as usize)));
+                    }
+
+                   self.set_gpr(instr.rt, (instr.offset as u32) << 16); 
+                },
+                0b00_001001 => {
+                    // ADDIU
+                    let instr = IFormat::from(instr);
+                    let im = instr.offset as i16 as i32 as u32;
+                    self.set_gpr(instr.rt, self.gpr(instr.rs).wrapping_add(im));
+                },
+
+                // Loads and stores
+                0b00_100011 => {
+                    // LW
+                    let instr = IFormat::from(instr);
+                    let base  = instr.rs;
+                    let off   = instr.offset as i16 as i32 as u32; 
+                    
+                    let addr = self.gpr(base).wrapping_add(off);
+                    println!("b= {:#x} off= {:#x}", base, off);
+                    println!("about to read {:#x}", addr);
+                    let v = self.mem.read_u32_le(VirtAddr(addr as usize))?;
+                    println!("read {:#x} from addr {:#x}", v, addr);
+                    self.set_gpr(instr.rt, v);
+
+
+                },
+                0b00_101011 => {
+                    // SW
+                    let instr = IFormat::from(instr);
+                    let base  = instr.rs;
+                    let off   = instr.offset as i16 as i32 as u32; 
+                    
+                    let addr  = self.gpr(base).wrapping_add(off) as usize;
+                    self.mem.write_u32_le(VirtAddr(addr), self.gpr(instr.rt))?;
+                },
+
                 
                 0b00_000001 => {
-                    // BGEZ
+                    // regimm
+                    let instr_val = instr;
                     let instr = IFormat::from(instr);
 
-                    if self.gpr(instr.rs) as i32 >= 0 {
-                        let target_offset = (instr.offset as i16 as i32) << 2;
-                        let target_pc = (target_offset as u32)
-                                    .wrapping_add(self.pc());
+                    match instr.rt {
+                        0b000_00001 => {
+                            // BGEZ
+                            if self.gpr(instr.rs) as i32 >= 0 {
+                                let toff = (instr.offset as i16 as i32) << 2;
+                                let target_pc = (toff as u32)
+                                            .wrapping_add(self.pc());
 
-                        // We set pc to the actual target address minus 4 but we
-                        // also save the address of the delay slot so that
-                        // in the next iteration it is executed instead.
-                        // After the delay slot is executed, execution will
-                        // continut at pc+4 because the execution of the slot
-                        // will increment pc by 4.
-                        // See the `match` expression at the
-                        // begining of the execution loop and the increment
-                        // to pc at the end of said loop.
+                                jmp_target = Some(target_pc);
+                                self.set_pc(pc.wrapping_add(4));
+                                continue 'next_instr;
+                            }
 
-                        self.set_pc(target_pc);
-                        slot_pc = Some(pc.wrapping_add(4));
-                        continue 'next_instr;
+                        },
+
+                        0b000_10001 => {
+                            // BGEZAL
+                            if self.gpr(instr.rs) as i32 >= 0 {
+                                let toff = (instr.offset as i16 as i32) << 2;
+                                let target_pc = (toff as u32)
+                                            .wrapping_add(self.pc());
+                                
+                                self.set_gpr(31, pc.wrapping_add(8));
+                                
+                                jmp_target = Some(target_pc);
+                                println!("jmp_target: {:#x}", target_pc);
+                                self.set_pc(pc.wrapping_add(4));
+                                continue 'next_instr;
+                            }
+
+                        },
+                        x => unimplemented!("pepito perez {:#x}", instr_val),
                     }
-                }
+                },
 
                 _ => unimplemented!("{:#x?} @ pc {:#x?}", instr, pc),
-            }
+            
+            
+            } // end op match.
+            
+            let next_pc = match jmp_target {
+                None => pc.wrapping_add(4),
+                Some(val) => {
+                    jmp_target = None;
+                    val
+                }
+            };
+            self.set_pc(next_pc); 
 
-            let pc = pc.wrapping_add(4);
-            self.set_pc(pc);
-        }
+        } // end 'next_instr loop.
     }
 
     /// Map the main ELF binary from a file into the guest.
@@ -399,9 +461,11 @@ impl Vm {
             .ok_or(24)?
         ).ok_or(25)?;
         
-        // Iterate over each program header and collect the info we need about
-        // each PT_LOAD segment.
-
+        
+        // Iterate over each segment. Ignore non-PT_LOADs and map the
+        // PT_LOAD segment. Collect the end of the last PT_LOAD segment
+        // so we can set data_end and brk.
+        let mut data_end: Option<usize> = None;
         let phs = phs_bytes.chunks(ph_entsize as usize);
         for ph in phs {
             if read_u32_le(ph, 0).or(Err(12))? != 1 {
@@ -445,13 +509,22 @@ impl Vm {
                 self.mem.add_perms(VirtAddr(va + fz), zeroes.len(),
                     perms).or(Err(21))?;
             }
+
+            data_end = Some(va + mz);
         }
+        
+        match data_end {
+            Some(v) => self.mem.data_end = v,
+            None => return Err(30),
+        }
+        self.mem.brk = self.mem.data_end;
 
         // Get the entry point.
         let e_entry: u32 = read_u32_le(&bin, 0x18).or(Err(26))?;
 
         // Set the program counter to the entry point.
         self.set_pc(e_entry);
+
 
         Ok(())
     }

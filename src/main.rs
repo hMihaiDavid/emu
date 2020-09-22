@@ -42,7 +42,7 @@ pub fn main() {
     }*/
 
     let mut m = Vm::new(8*1024*1024);
-    match m.map_elf(Path::new("../../foo")) {
+    match m.map_elf(Path::new("../../bar")) {
         Err(m) => panic!("Cannot map ELF: {}", m),
         _ => () ,
     }
@@ -51,7 +51,20 @@ pub fn main() {
     let mut m2 = m.fork();
     m2.mem.write_ignore_perms(VirtAddr(0x4005d0), &buf[..]); // overwrite first instruction.
     m2.reset(&m);
-    m2.run_interpreted();
+    //use vm_mem::PERM_RAW;
+    //m2.mem.add_perms(VirtAddr(0), 100, Perm(PERM_READ | PERM_RAW));
+   
+    use crate::vm::GReg;
+    let st = m2.mem.grow_stack(1024*1024).unwrap();
+
+    m2.set_gpr(GReg::Sp as usize, (m2.mem.mem.len()-16) as u32); 
+    
+
+    //let brk = m2.mem.brk(VirtAddr(0)).ok_or(()).unwrap();
+    //m2.mem.brk(VirtAddr(brk+1024));
+
+    println!("top of stack right before run: {:#x}", m2.gpr(GReg::Sp as usize));
+    m2.run_interpreted().unwrap();
 
 
 }

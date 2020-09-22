@@ -45,7 +45,18 @@ pub struct Mem {
     /// There is one bit for each block of memory of size `DIRTY_BLOCK_SZ`.
     /// It is used to keep track of which dirty blocks have been added to
     /// the `dirty_blocks_list` so that a block is not added more than once.
-    dirty_blocks_bmp: Vec<u8>,
+    pub dirty_blocks_bmp: Vec<u8>,
+    
+    /// top of the stack.
+    pub stack_top: usize,
+
+    /// program break
+    pub brk: usize,
+
+    /// end of the last PT_LOAD segment of the ELF. This will be the initial
+    /// program break. It is used so that decreasing program break doesn't 
+    /// underflow.
+    pub data_end: usize,
 }
 
 impl Mem {
@@ -62,6 +73,19 @@ impl Mem {
 
             dirty_blocks_list: Vec::with_capacity( size / DIRTY_BLOCK_SZ + 1),
             dirty_blocks_bmp:   vec![0; size / DIRTY_BLOCK_SZ  / 8 + 1],
+            
+            // no stack initially. Call self.grow_stack() to increase stack.
+            stack_top: size,
+
+            
+            // These two are properly initialized by load_elf. 0 is invalid.
+
+            // End address of highest loaded elf segment. Never changes.
+            data_end: 0usize,
+            // Program break, initially set to data_end, will be changed
+            // by calls to self.brk() UNIX style :)
+            brk: 0usize,
+            
         }
     }
 
@@ -75,6 +99,11 @@ impl Mem {
             dirty_blocks_list: Vec::with_capacity(self.dirty_blocks_list
                                                   .capacity()),
             dirty_blocks_bmp:  vec![0x00; self.dirty_blocks_bmp.capacity()],
+            
+            stack_top: self.stack_top,
+
+            brk: self.brk,
+            data_end: self.data_end,
         }
     }
 
@@ -82,30 +111,92 @@ impl Mem {
         // Restore the dirtied blockes of `mem` and `perms`.
         for block in &self.dirty_blocks_list {
             let block = *block;
-            //println!("[DBG] ---- {:#x}", block);
             
             let a = block * DIRTY_BLOCK_SZ;
             let b = a + DIRTY_BLOCK_SZ;
-            //println!("[DBG] !!!! {:#x} .. {:#x}", a, a + DIRTY_BLOCK_SZ);
             
             &self.mem[a .. b].copy_from_slice(&prev.mem[a .. b]);
             &self.perms[a .. b].copy_from_slice(&prev.perms[a .. b]);
         }
 
-        self.clear_dirty_all();
+        self.dirty_blocks_list.clear();
+        self.dirty_blocks_bmp.iter_mut().for_each(|x| *x=0); // calling clear()
+                                                // here is a big bug!
+
+        self.stack_top = prev.stack_top;
+        self.brk = prev.brk;
+        self.data_end = prev.data_end;
     }
+
+    /// Grows the stack by the given amount.
+    pub fn grow_stack(&mut self, amnt: usize) -> Result<VirtAddr, VmExit> {
+        let nst = self.stack_top.checked_sub(amnt).
+                                  ok_or(VmExit::AddrOverflow(VirtAddr(!0)))?;
+        if(nst <= self.brk) { // TODO improve error reporting.
+           return Err(VmExit::AddrOverflow(VirtAddr(!0)));
+        }
+
+        self.add_perms(VirtAddr(nst), self.stack_top - nst,
+                       Perm(PERM_READ | PERM_WRITE ));
+        self.stack_top = nst;
+
+        Ok(VirtAddr(nst)) // return the new stack top.
+    }
+
+    /// shrink the stack by the given amount.
+    pub fn shrink_stack(&mut self, amnt: usize) -> Result<VirtAddr, VmExit> {
+        let nst = self.stack_top.checked_add(amnt)
+                    .ok_or(VmExit::AddrOverflow(VirtAddr(!0)))?;
+        if nst >= self.mem.len() {
+            return Err(VmExit::AddrOverflow(VirtAddr(!0)));
+        }
+        
+        // Remove all perms
+        self.remove_perms(VirtAddr(self.stack_top), nst - self.stack_top,
+                                   Perm(!0));
+        
+        self.stack_top = nst;
+        Ok(VirtAddr(nst))
+    }
+    
+    pub fn brk(&mut self, addr: VirtAddr) -> Option<usize> {
+        let addr = addr.0;
+
+        if addr == 0 || addr == self.brk {
+            return Some(self.brk);
+        }
+
+        // check collision with main binary and stack.
+        if addr < self.data_end  || addr >= self.stack_top {
+            return None;
+        }
+        
+        // Set permissions of the increased or decreased region appropiately.
+        if addr < self.brk {
+            self.set_perms(VirtAddr(addr), self.brk-addr, Perm(0));    
+        } else { // addr > self.brk  (because of equality check at the begining)
+            self.set_perms(VirtAddr(self.brk), addr-self.brk,
+                           Perm(PERM_READ | PERM_WRITE));
+        }
+        
+        // Set the new brk and return it.
+        self.brk = addr;
+        Some(addr)
+    } 
+        
 
     /// Set as dirty the memory in the range [addr, addr+size).
     /// It can panic if out of bounds so make sure it is called 
     /// after bound checking is already performed.
     #[inline]
     fn set_dirty(&mut self, addr: VirtAddr, size: usize) -> () {
+        if size == 0 { return }
         let addr = addr.0;
        
         let start = addr / DIRTY_BLOCK_SZ;
-        let end   = (addr + size) / DIRTY_BLOCK_SZ;
+        let end   = ((addr + size)-1) / DIRTY_BLOCK_SZ;
         
-        for block in start ..= end { // XXX 
+        for block in start ..= end { 
             let off = block / 8;
             let idx = block % 8;
             
@@ -117,13 +208,7 @@ impl Mem {
             }
         }
     }
-    /// Make all memory non-dirty.
-    #[inline]
-    fn clear_dirty_all(&mut self) -> () {
-        self.dirty_blocks_bmp.clear();
-        self.dirty_blocks_list.clear();
-    }
-
+    
     /// Reads guest memory from `addr` into `buf`
     /// without checking memory permissions. It does the necessary bound 
     /// checking. 
@@ -148,7 +233,7 @@ impl Mem {
         let sl = self.mem.get_mut(
             addr.0 ..
             addr.0.checked_add(buf.len()).ok_or(VmExit::AddrOverflow(addr))?
-        ).ok_or(VmExit::ReadFault(addr))?;
+        ).ok_or(VmExit::WriteFault(addr))?;
         
         // This won't panic cause bound checking is performed already.
         sl.copy_from_slice(buf);
@@ -175,13 +260,14 @@ impl Mem {
         
         // Check for permissions and detect read from uninitialized memory.
         for (i, p) in psl.iter().enumerate() {
+            if (p.0 & PERM_READ) == 0 { 
+                return Err(VmExit::ReadFault(VirtAddr(addr.0 + i)));
+            }
+
             if (p.0 & PERM_RAW) == 0 {
                 return Err(VmExit::ReadUninit(VirtAddr(addr.0 + i)));
             }
 
-            if (p.0 & PERM_READ) == 0 { 
-                return Err(VmExit::ReadFault(VirtAddr(addr.0 + i)));
-            }
         }
         
         Ok(())
@@ -266,7 +352,7 @@ impl Mem {
 
         self.mem[addr.0 .. addr.0 + buf.len()].copy_from_slice(buf);
         
-        // Set the dirty bits and RAW bits. See `Perm`.
+        // Set the RAW bits. See `Perm`.
         self.perms.get_mut(addr.0 .. addr.0 + buf.len()).unwrap()
             .iter_mut().for_each(|x| x.0 |= PERM_RAW);
 
@@ -288,6 +374,15 @@ impl Mem {
         Ok(())
     }
     
+    pub fn set_perms(&mut self, addr: VirtAddr, size: usize, perm: Perm)
+        -> Result<(), ()> {
+        self.perms.get_mut(addr.0 .. addr.0.checked_add(size).ok_or(())?)
+            .ok_or(())?.iter_mut()
+            .for_each(|x| x.0 = perm.0);
+
+        Ok(())
+    }
+
     pub fn remove_perms(&mut self, addr: VirtAddr, size: usize, perm: Perm)
         -> Result<(), ()> {
         self.perms.get_mut(addr.0 .. addr.0.checked_add(size).ok_or(())?)
@@ -327,13 +422,36 @@ impl Mem {
                               .try_into().unwrap() ))
     }
     
+    #[inline]
+    pub fn write_u32_le(&mut self, addr: VirtAddr, val: u32)
+        -> Result<(), VmExit> {
+        let sl = unsafe {
+            core::slice::from_raw_parts(&val as *const u32 as *const u8, 4)
+        };
+        self.write(addr, sl);
+        Ok(())
+    }
+    
+    #[inline]
+    pub fn write_u16_le(&mut self, addr: VirtAddr, val: u16)
+        -> Result<(), VmExit> {
+        let sl = unsafe {
+            core::slice::from_raw_parts(&val as *const u16 as *const u8,
+                                        core::mem::size_of::<u16>())
+        };
+        self.write(addr, sl);
+        Ok(())
+    }
 
-    // TODO !!
-    //#[inline]
-    /*fn write_u32_le(addr: VirtAddr, val: u32) -> Result<u32, VmExit> {
-        self.perms_check_write(addr, 4)?;
-        Ok(u32::from_le_bytes(&self.mem[addr.0 .. addr.0 + 4]
-                              .try_into().unwrap()));
-    }*/
+    #[inline]
+    pub fn write_u8_le(&mut self, addr: VirtAddr, val: u8)
+        -> Result<(), VmExit> {
+        let sl = unsafe {
+            core::slice::from_raw_parts(&val as *const u8,
+                                        core::mem::size_of::<u8>())
+        };
+        self.write(addr, sl);
+        Ok(())
+    }
 
 }
