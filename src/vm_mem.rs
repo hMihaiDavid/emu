@@ -137,7 +137,7 @@ impl Mem {
         }
 
         self.add_perms(VirtAddr(nst), self.stack_top - nst,
-                       Perm(PERM_READ | PERM_WRITE ));
+                       Perm(PERM_READ | PERM_WRITE));
         self.stack_top = nst;
 
         Ok(VirtAddr(nst)) // return the new stack top.
@@ -309,7 +309,7 @@ impl Mem {
         let psl = self.perms.get(
             addr.0 ..
             addr.0.checked_add(size).ok_or(VmExit::AddrOverflow(addr))?
-            ).ok_or(VmExit::ReadFault(addr))?;
+            ).ok_or(VmExit::ExecFault(addr))?;
         
         // Check for `PERM_EXEC` permission on all bytes.
         for (i, p) in psl.iter().enumerate() {
@@ -409,14 +409,14 @@ impl Mem {
     }
     
     #[inline]
-    pub fn read_u16_le(self, addr: VirtAddr) -> Result<u16, VmExit> {
+    pub fn read_u16_le(&self, addr: VirtAddr) -> Result<u16, VmExit> {
         self.check_perms_read(addr, 2)?;
         Ok(u16::from_le_bytes( (&self.mem[addr.0 .. addr.0 + 2])
                               .try_into().unwrap() ))
     }
     
     #[inline]
-    pub fn read_u8_le(self, addr: VirtAddr) -> Result<u8, VmExit> {
+    pub fn read_u8_le(&self, addr: VirtAddr) -> Result<u8, VmExit> {
         self.check_perms_read(addr, 1)?;
         Ok(u8::from_le_bytes( (&self.mem[addr.0 .. addr.0 + 1])
                               .try_into().unwrap() ))

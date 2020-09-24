@@ -5,7 +5,7 @@ use std::path::Path;
 
 use vm::Vm;
 use vm_mem::VirtAddr;
-use vm_mem::{Perm, PERM_WRITE, PERM_READ, PERM_EXEC, PERM_RAW};
+use vm_mem::{Perm, PERM_WRITE, PERM_READ, PERM_EXEC };
 
 pub fn main() {
     //println!("Hello, world!");
@@ -42,7 +42,7 @@ pub fn main() {
     }*/
 
     let mut m = Vm::new(8*1024*1024);
-    match m.map_elf(Path::new("../../foo")) {
+    match m.map_elf(Path::new("../../bar")) {
         Err(m) => panic!("Cannot map ELF: {}", m),
         _ => () ,
     }
@@ -56,16 +56,14 @@ pub fn main() {
    
     use crate::vm::GReg;
     let st = m2.mem.grow_stack(1024*1024).unwrap();
-    m2.mem.add_perms(st, 1024*1024, Perm(PERM_RAW)).unwrap();
 
     //m2.set_gpr(GReg::Sp as usize, (m2.mem.mem.len()-1i28) as u32); 
-    let mut p = m2.mem.mem.len()-16;
-    p = p & 0xffffff10; // align down to 16
+    let mut p = m2.mem.mem.len()-4;
+    p = p & 10; // align down to 16
     
     p = p - 4;
-    m2.mem.write(VirtAddr(p), b"foo\x00"); let arg0_addr = p;
+    m2.mem.write(VirtAddr(p), b"bar\x00"); let arg0_addr = p;
     
-    println!("%%%%%%%%%%%%%%%%%%%%%%%% {:#x}", p);
     p = p - 8;
     m2.mem.write(VirtAddr(p), b"\x00\x00\x00\x00\x00\x00\x00\x00"); // null auxv
 
@@ -75,17 +73,17 @@ pub fn main() {
     p = p - 4;
     m2.mem.write(VirtAddr(p), b"\x00\x00\x00\x00"); // end argv pointers
     p = p - 4;
-    let arg0 = b"\x0c\xff\x7f\x00";//       "0x7fff0c";
+    let arg0 = unsafe { std::slice::from_raw_parts(arg0_addr as *const usize as *const u8, 4) };
     m2.mem.write(VirtAddr(p), arg0); // arg0
 
     p = p - 4;
     m2.mem.write(VirtAddr(p), b"\x01\x00\x00\x00"); // argc = 1;
 
-    m2.set_gpr(GReg::Sp as usize, p as u32);
+
 
     //let brk = m2.mem.brk(VirtAddr(0)).ok_or(()).unwrap();
     //m2.mem.brk(VirtAddr(brk+1024));
-    
+
     m2.run_interpreted().unwrap();
 
 

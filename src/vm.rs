@@ -64,7 +64,7 @@ impl From<u32> for RFormat {
     fn from(inst: u32) -> Self {
         RFormat {
             funct: (inst & 0x3f ) as u8,             // lower 6 bits
-            shamt: ( (inst >> 5) & 0x1f) as u8,      // next  5 bits
+            shamt: ( (inst >> 6) & 0x1f) as u8,      // next  5 bits
             rd   : ( (inst >> 11) & 0x1f) as usize,  // next  5 bits 
             rt   : ( (inst >> 16) & 0x1f) as usize,  // next  5 bits 
             rs   : ( (inst >> 21) & 0x1f) as usize,  // next  5 bits 
@@ -116,6 +116,9 @@ pub enum VmExit {
     IntegerOverflow(VirtAddr),
     /// An invalid instruction at `VirtAddr` attempted execution. 
     IllegalInstruction(VirtAddr),
+    /// Instruction at address `VirtAddr` signaled a trap with code `u32`.
+    /// Example: TEQ with code 7 is a division by zero in linux abi I think (?)
+    TrapException(VirtAddr, u32),
 
     /// Collision between data segment and stack segment. This happens
     /// because of brk() or when growing stack.
@@ -204,14 +207,114 @@ impl Vm {
 
         'next_instr: loop {
             let pc: u32    = self.pc();
-            
+
             let instr: u32 = self.mem.read_u32_le_exec(
-                                        VirtAddr(pc as usize))?;
+                                        VirtAddr(pc as usize))?; 
+
             let instr_val = instr;
             
             println!("Executing instruction {:x} @ pc {:#x}", instr_val, pc);
-
             match (instr >> 26) as u8 { // higher 6 bits or op.
+                0b00_110011 => {
+                    // PREF
+                    // Do nothing.
+                },
+
+                0b00_011100 => { // SPECIAL2
+                    let instr = RFormat::from(instr);
+                    match instr.funct {
+                        0b00_000010 => {
+                            // MUL
+                            if instr.shamt != 0 {
+                                return Err(VmExit::IllegalInstruction(
+                                           VirtAddr(pc as usize)));
+                            }
+                            /*let mut hi: u32;
+                            let lo = core::arch::x86_64::_mulx_u32(
+                               self.gpr(instr.rs), self.gpr(instr.rt), &mut hi);
+                            
+                            self.set_gpr(instr.rd) = lo;*/
+                            self.set_gpr(instr.rd,
+                            ( (self.gpr(instr.rs)as i32) * 
+                              (self.gpr(instr.rt)as i32) ) as u32
+                            ); // TODO: Check if this is correct.
+                        }
+
+                        _ => {
+                                unimplemented!("R SPECIAL2 {:#x} @ pc {:#x}",
+                                                instr_val, pc);
+                        },
+                    }; // end match SPECIAL2
+                
+                },
+                0b00_011111 => { // SPECIAL3
+                    let instr = RFormat::from(instr);
+                    match instr.funct {
+                        0b00_100000 => {
+                            // BSHFL
+                            if instr.shamt != 0b000_11000 {
+                                unimplemented!("BSHFL");
+                            }
+                            // SEH
+                            let v = self.gpr(instr.rt) as u16 as i16 as i32;
+                            self.set_gpr(instr.rd, v as u32);
+                        },
+                    _ => unimplemented!("SPECIAL3")
+                    }
+                },
+
+                0b00_000011 => {
+                    // JAL
+                    // IMPORTANT:
+                    // The upper four bits of target address are the corresponding
+                    // bits of the address of the next instruction to this one (the slot).
+                    // This is not relevant for userspace but take it into account since
+                    // this emulator is not technically per spec. Life is tough.
+                    // See page 195 of MD00086-2B-MIPS32BIS-AFP-6.06.pdf
+
+                    self.set_gpr(31, pc.wrapping_add(8));
+                    let ta: u32 = (instr & 0x03ffffff) << 2;
+                    jmp_target = Some(ta);
+                    self.set_pc(pc.wrapping_add(4));
+                    continue 'next_instr;
+                },
+                0b00_000100 => {
+                    // BEQ
+                    let instr = IFormat::from(instr);
+                    
+                    if(self.gpr(instr.rs) == self.gpr(instr.rt)) {
+                        //println!("BEQ gpr(rs): {:#x} gpr(rt): {:#x}",
+                        //self.gpr(instr.rs), self.gpr(instr.rt));
+
+                        let mut ta = ((instr_val & 0x0000ffff) << 2) 
+                            as u16 as i16 as i32 as u32;
+                        ta = ta.wrapping_add(pc+4);
+                        //println!("ta: {:#x}", ta);
+                        jmp_target = Some(ta);
+                        self.set_pc(pc.wrapping_add(4));
+                        continue 'next_instr;
+                    }
+                },
+                0b00_000101 => {
+                    // BNEQ
+                    let instr = IFormat::from(instr);
+                    
+                    if(self.gpr(instr.rs) != self.gpr(instr.rt)) {
+                        //println!("BEQ gpr(rs): {:#x} gpr(rt): {:#x}",
+                        //self.gpr(instr.rs), self.gpr(instr.rt));
+
+                        let mut ta = ((instr_val & 0x0000ffff) << 2) 
+                            as u16 as i16 as i32 as u32;
+                        ta = ta.wrapping_add(pc+4);
+                        //println!("ta: {:#x}", ta);
+                        jmp_target = Some(ta);
+                        self.set_pc(pc.wrapping_add(4));
+                        continue 'next_instr;
+                    }
+                },
+
+
+
                 0b00_000000 => { // R-format (higher 6 bits (op) to zero)
                     let instr = RFormat::from(instr);
 
@@ -227,7 +330,6 @@ impl Vm {
                             self.set_gpr(instr.rd,
                                          self.gpr(instr.rt) << instr.shamt);
                         },
-
                         0b00_100101 => {
                             // OR
                             let res = self.gpr(instr.rs) | self.gpr(instr.rt);
@@ -280,10 +382,113 @@ impl Vm {
                                       .wrapping_sub(self.gpr(instr.rt));
                             self.set_gpr(instr.rd, res); 
                         },
+                        0b00_011011 => {
+                            // DIVU
+                            if instr.shamt != 0 || instr.rd != 0 {
+                                return Err(VmExit::IllegalInstruction(
+                                        VirtAddr(pc as usize)));
+                            }
+
+                            let dividend: u32  = self.gpr(instr.rs);
+                            let divisor:  u32  = self.gpr(instr.rt);
+                            if divisor != 0 {
+                                self.LO = dividend / divisor; // quotient
+                                self.HI = dividend % divisor; // remainder
+                            } // TODO: Check if this is correct.
+                        },
+                        0b00_010010 => {
+                            // MFLO
+                            if instr.shamt != 0 || instr.rs != 0
+                                || instr.rt != 0 {
+                                    return Err(VmExit::IllegalInstruction(
+                                            VirtAddr(pc as usize)));
+                            }
+                            self.set_gpr(instr.rd, self.LO);
+
+
+                        }, 
+
+                        0b00_101011 => {
+                            // SLTU
+                            if instr.shamt != 0 {
+                                return Err(VmExit::IllegalInstruction(
+                                        VirtAddr(pc as usize)));
+                            }
+
+                            if self.gpr(instr.rs) < self.gpr(instr.rt) {
+                                self.set_gpr(instr.rd, 1);
+                            } else {
+                                self.set_gpr(instr.rd, 0);
+                            }
+
+                        },
+
+                        0b00_001011 => {
+                            // MOVN
+                            if instr.shamt != 0 {
+                                 return Err(VmExit::IllegalInstruction(
+                                        VirtAddr(pc as usize))); 
+                            }
+                            if self.gpr(instr.rt) != 0 {
+                                self.set_gpr(instr.rd, instr.rs as u32);
+                            }
+                        },
+                        0b00_001010 => {
+                            // MOVZ
+                            if instr.shamt != 0 {
+                                 return Err(VmExit::IllegalInstruction(
+                                        VirtAddr(pc as usize))); 
+                            }
+                            if self.gpr(instr.rt) == 0 {
+                                self.set_gpr(instr.rd, instr.rs as u32);
+                            }
+                        },
+
+
+                        0b00_001000 => {
+                            // JR
+                            if instr.rd != 0 || instr.rt != 0 {
+                                return Err(VmExit::IllegalInstruction(
+                                        VirtAddr(pc as usize)));
+                            }
+
+                            let target_pc = self.gpr(instr.rs);
+                            jmp_target = Some(target_pc);
+                            self.set_pc(pc.wrapping_add(4));
+                            continue 'next_instr;
+                        },
+                        0b00_001001 => {
+                            // JALR
+                            if instr.rt != 0 {
+                                return Err(VmExit::IllegalInstruction(
+                                        VirtAddr(pc as usize)));
+                            }
+                            
+                            self.set_gpr(instr.rd, pc.wrapping_add(8));
+                            let target_pc = self.gpr(instr.rs);
+                            jmp_target = Some(target_pc);
+                            self.set_pc(pc.wrapping_add(4));
+                            continue 'next_instr;
+
+                        },
+
+                        0b00_001100 => {
+                            // SYSCALL
+                            self.handle_syscall()?;
+                        },
+                        0b00_110100 => {
+                            // TEQ
+                            if self.gpr(instr.rs) == self.gpr(instr.rt) {
+                                let code = (instr_val >> 6) & 0x000003ff;
+                                return Err(VmExit::TrapException(
+                                    VirtAddr(pc as usize), code));
+                            }
+                        },
 
                     
                     _ => unimplemented!("R {:#x?} @ pc {:#x?}", instr, pc),
                     
+
                     }
 
                 
@@ -304,6 +509,20 @@ impl Vm {
                     let instr = IFormat::from(instr);
                     let im = instr.offset as i16 as i32 as u32;
                     self.set_gpr(instr.rt, self.gpr(instr.rs).wrapping_add(im));
+                    //println!("CCCCC ADDIU im: {:#x}, gpr(instr.rs): {:#x}", im, self.gpr(instr.rs));
+                    //println!("gpr(instr.rt) {:#x}", self.gpr(GReg::Sp as usize));
+                },
+                0b00_001100 => {
+                    // ANDI
+                    let instr = IFormat::from(instr);
+                    let im = instr.offset as u32;
+                    self.set_gpr(instr.rt, im & self.gpr(instr.rs));
+                },
+                0b00_001101 => {
+                    // ORI
+                    let instr = IFormat::from(instr);
+                    let im = instr.offset as u32;
+                    self.set_gpr(instr.rt, im | self.gpr(instr.rs));
                 },
 
                 // Loads and stores
@@ -314,13 +533,11 @@ impl Vm {
                     let off   = instr.offset as i16 as i32 as u32; 
                     
                     let addr = self.gpr(base).wrapping_add(off);
-                    println!("b= {:#x} off= {:#x}", base, off);
-                    println!("about to read {:#x}", addr);
+                    //println!("b= {:#x} off= {:#x}", base, off);
+                    //println!("about to read {:#x}", addr);
                     let v = self.mem.read_u32_le(VirtAddr(addr as usize))?;
-                    println!("read {:#x} from addr {:#x}", v, addr);
+                    //println!("read {:#x} from addr {:#x}", v, addr);
                     self.set_gpr(instr.rt, v);
-
-
                 },
                 0b00_101011 => {
                     // SW
@@ -329,7 +546,41 @@ impl Vm {
                     let off   = instr.offset as i16 as i32 as u32; 
                     
                     let addr  = self.gpr(base).wrapping_add(off) as usize;
+                    
                     self.mem.write_u32_le(VirtAddr(addr), self.gpr(instr.rt))?;
+                },
+                0b00_101000 => {
+                    // SB
+                    let instr = IFormat::from(instr);
+                    let base  = instr.rs;
+                    let off   = instr.offset as i16 as i32 as u32; 
+                    
+                    let addr  = self.gpr(base).wrapping_add(off) as usize;
+                    
+                    self.mem.write_u8_le(VirtAddr(addr), 
+                                         self.gpr(instr.rt) as u8)?;
+                },
+                0b00_100000 => {
+                    // LB
+                    let instr = IFormat::from(instr);
+                    let base  = instr.rs;
+                    let off   = instr.offset as i16 as i32 as u32; 
+                    
+                    let addr = self.gpr(base).wrapping_add(off) as usize;
+                    let v = self.mem.read_u8_le(VirtAddr(addr))? as i8 as i32;
+                    self.set_gpr(instr.rt, v as u32);
+
+                }
+
+
+                0b00_100101 => {
+                    // LHU
+                    let instr = IFormat::from(instr);
+
+                    let ea = (instr_val & 0xffff).wrapping_add(self.gpr(instr.rs));
+                    let v = self.mem.read_u16_le(VirtAddr(ea as usize))? as u32;
+                    self.set_gpr(instr.rt, v);
+
                 },
 
                 
@@ -337,8 +588,21 @@ impl Vm {
                     // regimm
                     let instr_val = instr;
                     let instr = IFormat::from(instr);
-
+                    
                     match instr.rt {
+                        0b000_00000 => {
+                            // BLTZ
+                            if (self.gpr(instr.rs) as i32) < 0 {
+                                let toff = (instr.offset as i16 as i32) << 2;
+                                let target_pc = (toff as u32)
+                                            .wrapping_add(self.pc());
+
+                                jmp_target = Some(target_pc);
+                                self.set_pc(pc.wrapping_add(4));
+                                continue 'next_instr;
+                            }
+                        },
+
                         0b000_00001 => {
                             // BGEZ
                             if self.gpr(instr.rs) as i32 >= 0 {
@@ -352,7 +616,6 @@ impl Vm {
                             }
 
                         },
-
                         0b000_10001 => {
                             // BGEZAL
                             if self.gpr(instr.rs) as i32 >= 0 {
@@ -363,13 +626,54 @@ impl Vm {
                                 self.set_gpr(31, pc.wrapping_add(8));
                                 
                                 jmp_target = Some(target_pc);
-                                println!("jmp_target: {:#x}", target_pc);
                                 self.set_pc(pc.wrapping_add(4));
                                 continue 'next_instr;
                             }
 
                         },
-                        x => unimplemented!("pepito perez {:#x}", instr_val),
+                        
+                        x => unimplemented!("pepito perez {:#x}
+                                            @ pc {:x}", instr_val, pc),
+                    }
+                },
+                0b00_000110 => {
+                    // BLEZ
+                    let instr = IFormat::from(instr);
+                    if instr.rt != 0 {
+                        return Err(VmExit::IllegalInstruction(
+                            VirtAddr(pc as usize)));
+                    
+                    }
+                    
+                    if self.gpr(instr.rs) as i32 <= 0 {
+                        let toff = (instr.offset as i16 as i32) << 2;
+                        let target_pc = (toff as u32)
+                                    .wrapping_add(self.pc());
+
+                        jmp_target = Some(target_pc);
+                        self.set_pc(pc.wrapping_add(4));
+                        continue 'next_instr;
+                    }
+                },
+
+                0b00_001011 => {
+                    // SLTIU
+                    let instr = IFormat::from(instr);
+                    let imm = instr.offset as i16 as i32 as u32;
+                    if self.gpr(instr.rs) < imm {
+                        self.set_gpr(instr.rt, 1);
+                    } else {
+                        self.set_gpr(instr.rt, 0);
+                    }
+                },
+                0b00_001010 => {
+                    // SLTI
+                    let instr = IFormat::from(instr);
+                    let imm = instr.offset as i16 as i32;
+                    if (self.gpr(instr.rs) as i32) < imm {
+                        self.set_gpr(instr.rt, 1);
+                    } else {
+                        self.set_gpr(instr.rt, 0);
                     }
                 },
 
@@ -388,6 +692,86 @@ impl Vm {
             self.set_pc(next_pc); 
 
         } // end 'next_instr loop.
+    }
+
+// https://git.linux-mips.org/cgit/ralf/linux.git/tree/arch/mips/include/uapi/asm/unistd.h
+// https://www.linux-mips.org/wiki/Syscall
+    fn handle_syscall(&mut self) -> Result<(), VmExit> {
+        let nr: u32 = self.gpr(GReg::V0 as usize);
+        
+        match nr {
+            4049 => {
+                // __NR_geteuid
+                self.set_gpr(GReg::V0 as usize, 0); // return root UID (0)
+            },
+            4024 => {
+                // __NR_getuid
+                self.set_gpr(GReg::V0 as usize, 0); // return root UID (0)
+            },
+            4050 => {
+                // __NR_getegid
+                self.set_gpr(GReg::V0 as usize, 0); // return root GID (0)
+            },
+            4047 => {
+                // __NR_getgid
+                self.set_gpr(GReg::V0 as usize, 0); // return root UID (0)
+            },
+
+            4045 => {
+                // __NR_brk
+                println!("BRK a0: {:?} a1: {:?}", self.gpr(GReg::A0 as usize),
+                self.gpr(GReg::A1 as usize));
+                
+                let addr = self.gpr(GReg::A0 as usize) as usize;
+                let res = self.mem.brk(VirtAddr(addr));
+                let res = res.ok_or(VmExit::SegmentOverflow)?;
+
+                self.set_gpr(GReg::V0 as usize, res as u32);
+
+            },
+
+            4283 => {
+                // __NR_set_thread_area
+                // From man SET_THREAD_AREA(2):
+                // "On MIPS and m68k, set_thread_area() always returns 0."
+                // Nice!
+                self.set_gpr(GReg::V0 as usize, 0);
+            },
+
+            4288 => {
+                // __NR_openat
+                let arg1 = self.gpr(GReg::A1 as usize) as usize;
+
+                println!("------------ {:#x}", arg1);
+                let mut buf = [0u8; 64];
+                self.mem.read(VirtAddr(arg1), &mut buf).unwrap();
+                println!("[{:?}]", std::str::from_utf8(&buf));
+                
+                self.set_gpr(GReg::V0 as usize, !0);
+                //panic!("ALDI");
+            },
+
+            4146 => {
+                // __NR_writev
+                let arg0 = self.gpr(GReg::A0 as usize) as usize;
+                let arg1 = self.gpr(GReg::A1 as usize) as usize;
+                
+                let a = self.mem.read_u32_le(VirtAddr(arg1)).unwrap() as usize;
+                let mut buf = [0u8; 64];
+                self.mem.read(VirtAddr(a), &mut buf).unwrap();
+                
+                
+                panic!("!!!!!!!! writev arg0 {:?},,,, buf:[{:?}]",
+                       arg0, std::str::from_utf8(&buf));
+            },
+
+            _ => {
+                unimplemented!("SYSCALL nr: {:?}", nr);
+            }
+        }
+        
+
+        Ok(())
     }
 
     /// Map the main ELF binary from a file into the guest.
@@ -419,9 +803,9 @@ impl Vm {
              return Err(5);
         }
         // Checking EI_OSABI (1) maybe accept 0?
-        if bin.get(8) != Some(&(0x01 as u8)) {
+        /*if bin.get(8) != Some(&(0x01 as u8)) {
              return Err(6);
-        }
+        }*/
         // Now we can assume offsets into the file.
         
         // TODO: Check e_machine and e_flags. Not critical.
