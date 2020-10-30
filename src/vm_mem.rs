@@ -172,16 +172,20 @@ impl Mem {
         }
         
         // Set permissions of the increased or decreased region appropiately.
+        assert!(addr >= self.brk); // test
         if addr < self.brk {
             self.set_perms(VirtAddr(addr), self.brk-addr, Perm(0));    
         } else { // addr > self.brk  (because of equality check at the begining)
             self.set_perms(VirtAddr(self.brk), addr-self.brk,
-                           Perm(PERM_READ | PERM_WRITE));
+                           Perm(PERM_READ | PERM_WRITE | PERM_RAW));
+            // IMPORTANT: XXX: THE PERMS_RAW is bad, we should fix it somehow
+            // but libc needs it cause it does uninitialized reads apparently.
         }
         
         // Set the new brk and return it.
         self.brk = addr;
-        Some(addr)
+        //println!("AA new brk set to: {:#}", addr);
+        Some(self.brk)
     } 
         
 
@@ -261,6 +265,7 @@ impl Mem {
         // Check for permissions and detect read from uninitialized memory.
         for (i, p) in psl.iter().enumerate() {
             if (p.0 & PERM_READ) == 0 { 
+                //panic!("ReadFault({:#x}) @ pc {:#x}", addr.0+i, !0);
                 return Err(VmExit::ReadFault(VirtAddr(addr.0 + i)));
             }
 
